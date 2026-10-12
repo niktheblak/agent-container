@@ -1,0 +1,58 @@
+# compose.yaml
+services:
+  agent:
+    build:
+      context: .
+      args:
+        UID: ${UID:-10001}
+        GID: ${GID:-10001}
+    user: "${UID:-10001}:${GID:-10001}"
+    working_dir: /work
+    stdin_open: true
+    tty: true
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:default.json
+    pids_limit: 512
+    mem_limit: 4g
+    cpus: 2
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+      - /home/agent/.cache:rw,size=2g
+    volumes:
+      - ./my-project:/work
+      - ../shared-lib:/ref/shared-lib:ro
+      - agent-home:/home/agent
+    env_file: agent.env            # ANTHROPIC_API_KEY=... and nothing else
+    environment:
+      HTTP_PROXY: http://proxy:8888
+      HTTPS_PROXY: http://proxy:8888
+      NO_PROXY: ""
+      GOFLAGS: -mod=mod
+      GOCACHE: /home/agent/.cache/go-build
+      GOMODCACHE: /home/agent/.cache/go-mod
+    networks: [agent-net]
+    depends_on: [proxy]
+
+  proxy:
+    image: ghcr.io/example/tinyproxy:1.11   # any tinyproxy image; alpine + apk add tinyproxy works
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    user: "65534:65534"
+    tmpfs: [/tmp, /var/log/tinyproxy]
+    volumes:
+      - ./proxy/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
+      - ./proxy/allowlist:/etc/tinyproxy/allowlist:ro
+    networks: [agent-net, egress]
+
+networks:
+  agent-net:
+    internal: true
+  egress: {}
+
+volumes:
+  agent-home: {}
