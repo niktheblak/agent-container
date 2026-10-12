@@ -24,7 +24,7 @@ The design is three layers, each of which holds on its own:
 
 ## Building the image
 
-Install tooling as root at build time, then switch to a fixed-UID user and never come back. The agent needs a real shell, git and a language runtime, so a distroless base is impractical; `debian:bookworm-slim` is small enough and apt keeps the toolchain current.
+Install tooling as root at build time, then switch to a fixed-UID user and never come back. The agent needs a real shell, git and a language runtime, so a distroless base is impractical; `debian:trixie-slim` is small enough and apt keeps the toolchain current. Trixie (Debian 13) is the current stable and carries fewer open CVEs than bookworm under trivy; prefer it for new images.
 
 Three choices in the Dockerfile matter more than the rest:
 
@@ -33,7 +33,7 @@ Three choices in the Dockerfile matter more than the rest:
 - **Writable home on a known path.** The agent's config and cache live under `/home/agent`; at runtime that path is a volume or tmpfs, because the root filesystem will be mounted read-only.
 
 ```dockerfile
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 ARG UID=10001
 ARG GID=10001
@@ -58,7 +58,7 @@ ENV HOME=/home/agent
 ENTRYPOINT ["claude"]
 ```
 
-Run the setuid strip as the last step of the package layer, not in a separate `RUN`, so a later `apt-get` cannot quietly reintroduce the bits. Pin the base image by digest once the image is stable; an unpinned `bookworm-slim` is a supply-chain surface of its own.
+Run the setuid strip as the last step of the package layer, not in a separate `RUN`, so a later `apt-get` cannot quietly reintroduce the bits. Pin the base image by digest once the image is stable; an unpinned `trixie-slim` is a supply-chain surface of its own.
 
 ## Runtime hardening flags
 
@@ -109,8 +109,6 @@ Never mount these, whatever the agent claims it needs:
 
 Put the agent on a Docker network with no route out, and give it one door: an HTTP proxy that only forwards to an allowlist. The agent needs the model API, usually a git host, and perhaps a package registry; everything else is exfiltration surface.
 
-&#91;embedded content: agent network · one proxy, four allowed hosts\]
-
 The agent and the proxy share the internal network; only the proxy also sits on a network with a route out, and it forwards solely to the allowlist.
 
 The pieces:
@@ -145,7 +143,7 @@ LogLevel Connect
 
 `FilterURLs Off` matches the hostname rather than the full URL, which also covers `CONNECT` tunnels for HTTPS. Option names shifted between Tinyproxy 1.10 and 1.11 (`FilterType` replaced `FilterExtended`), so check `man tinyproxy.conf` on the version your image ships. The `LogLevel Connect` line gives you one log line per destination, which is the audit trail of everything the agent tried to reach.
 
-**Local models.** If the agent should use Ollama on the LAN or over Tailscale, the proxy can reach it because the proxy's second network has a route to the host's networks. Add the Ollama host to the allowlist and point the agent at `http://ollama.tail1234.ts.net:11434`; plain-HTTP requests go through the proxy as ordinary `GET`s, so no extra `ConnectPort` is needed. Keep `NO_PROXY` empty, or the client will bypass the proxy and find no route.
+**Local models.** If the agent should use Ollama on the LAN or over Tailscale, the proxy can reach it because the proxy's second network has a route to the host's networks. Add the Ollama host to the allowlist and point the agent at `http://ollama.tail1234.ts.net:11434`; plain-HTTP requests go through the proxy as ordinary `GET`s, so no extra `ConnectPort` is needed. Keep `NO_PROXY` empty, or the client will bypass the proxy and find no route. Ollama on the same host is simpler still: the GPU section below puts it on a shared internal network, no proxy in the path.
 
 **Fully offline.** For refactoring or test runs with a local model you have already pulled, `--network none` is simpler than any allowlist and leaves nothing to audit.
 
@@ -196,7 +194,7 @@ services:
     depends_on: [proxy]
 
   proxy:
-    image: ghcr.io/example/tinyproxy:1.11   # any tinyproxy image; alpine + apk add tinyproxy works
+    image: docker.io/kalaksi/tinyproxy
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -210,17 +208,20 @@ services:
 networks:
   agent-net:
     internal: true
+    ipam:
+      config:
+        - subnet: 10.200.1.0/24   # pinned, so the proxy's Allow line is the same on every host
   egress: {}
 
 volumes:
   agent-home: {}
 ```
 
-Fetch Docker's default seccomp profile once and keep it next to the compose file, so the `seccomp:` line resolves on any host:
+Fetch Docker's default seccomp profile once and keep it next to the compose file, so the `seccomp:` line resolves on any host. The profile lives in the moby/profiles repository; older links into moby/moby are dead, and the fixtures/default.json still in that repo is a stale test fixture that breaks modern glibc:
 
 ```bash
 curl -fsSLo default.json \
-  https://raw.githubusercontent.com/moby/moby/master/profiles/seccomp/default.json
+  https://raw.githubusercontent.com/moby/profiles/main/seccomp/default.json
 ```
 
 Then:
@@ -238,7 +239,7 @@ A few things the file is doing that are easy to miss:
 - `agent.env` holds one line. If it holds more, the extra lines are the thing you are leaking.
 - `depends_on` does not wait for the proxy to be ready, only started. Tinyproxy starts in well under a second, so this is fine in practice; add a healthcheck if the first request ever races it.
 
-Anthropic maintains a reference devcontainer for Claude Code in the [claude-code repository](https://github.com/anthropics/claude-code) that takes the packet-filter route (an iptables allowlist installed at startup) rather than a proxy sidecar. It is worth reading as a second opinion on the same problem.
+Anthropic maintains a reference devcontainer for Claude Code in the [claude-code repository](https://github.com/anthropics/claude-code/tree/main/.devcontainer) that takes the packet-filter route (an iptables allowlist installed at startup) rather than a proxy sidecar. It is worth reading as a second opinion on the same problem.
 
 ## Verifying the sandbox
 
@@ -268,6 +269,101 @@ On the host, two more:
 - `aa-status | grep docker-default` → the profile is listed and enforcing
 
 Keep the table as a script in the repo and run it from CI whenever the Dockerfile or compose file changes. A sandbox that was correct last month is a claim, not a fact.
+
+## Local inference on an NVIDIA GPU
+
+A GPU container needs no CUDA driver in the image and no capabilities: the NVIDIA Container Toolkit mounts the host driver's user-space libraries into the container at start and exposes the `/dev/nvidia*` device nodes through the device cgroup. Ollama then runs under the same non-root, cap-dropped, read-only rules as the agent, with two additions: a GPU device request and a writable models volume.
+
+**How the GPU gets in.** The kernel driver (`nvidia.ko`) stays on the host; a container talks to it through `ioctl` calls on `/dev/nvidiactl`, `/dev/nvidia0` and `/dev/nvidia-uvm`. Those device nodes are mode `0666` on a stock install, which is why a non-root UID in the container can use them. The toolkit's job is to put the matching `libcuda.so`, `libnvidia-ml.so` and friends inside the container, because they must match the host driver version exactly and the Ollama image ships only the CUDA runtime on top of them. Two ways to ask for it:
+
+| Mode | Request | How the libraries arrive | Notes |
+| --- | --- | --- | --- |
+| Legacy (`nvidia` runtime) | `--gpus '"device=0"'`, or `deploy.resources.reservations.devices` in compose | A root-run OCI hook on the host, at every container start | Works on any Docker version since 19.03; the hook is the surface the 2024–2025 toolkit escapes targeted |
+| CDI | `--device nvidia.com/gpu=0`, or `devices: [nvidia.com/gpu=0]` in compose | A device spec generated once (`nvidia-ctk cdi generate`) that the daemon applies itself; no hook | Docker 25+ with CDI enabled in `daemon.json` (on by default from Docker 28); NVIDIA's recommended mode |
+
+Host setup, once:
+
+```bash
+# host driver first; nvidia-smi must work on the host before anything below
+sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker   # legacy mode
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml   # CDI mode
+sudo systemctl restart docker
+```
+
+Keep the toolkit on the same update cadence as the kernel. It is the one component in this setup that runs as root on the host on the container's behalf, and CVE-2024-0132 and CVE-2025-23266 were both container-to-host escapes through it; CDI mode did not carry the vulnerable hook.
+
+**The Ollama service.** Added to the compose file from the earlier section:
+
+```yaml
+  ollama:
+    image: ollama/ollama:latest          # pin by digest once it works
+    user: "10002:10002"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    init: true
+    pids_limit: 256
+    mem_limit: 16g
+    tmpfs:
+      - /tmp:rw,size=1g                # older releases unpack GPU runners here, so no noexec
+    volumes:
+      - ollama-home:/home/ollama
+    environment:
+      HOME: /home/ollama
+      OLLAMA_MODELS: /home/ollama/models
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_KEEP_ALIVE: 30m
+      NVIDIA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HTTPS_PROXY: http://proxy:8888   # model pulls only; inference needs no egress
+    devices:
+      - nvidia.com/gpu=0               # CDI; see below for the legacy form
+    networks: [model-net, agent-net]
+
+volumes:
+  ollama-home: {}
+
+networks:
+  model-net:
+    internal: true
+```
+
+For legacy mode, replace the `devices:` block with:
+
+```yaml
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+```
+
+What the file is doing:
+
+- `NVIDIA_DRIVER_CAPABILITIES: compute,utility` mounts only the CUDA and NVML libraries. The other classes (`graphics`, `video`, `display`) pull in Vulkan, NVENC and X11 pieces Ollama never calls.
+- `NVIDIA_VISIBLE_DEVICES: "0"` is belt and braces with the device request; on a one-GPU host both say the same thing, on a multi-GPU host they must agree.
+- The image runs as root by default and writes to `/root/.ollama`; `user`, `HOME` and `OLLAMA_MODELS` move all of that to a volume the non-root UID owns. Create the volume's ownership once with `docker compose run --rm --user 0 ollama chown -R 10002:10002 /home/ollama`.
+- `mem_limit` bounds host RAM, not VRAM. Ollama decides for itself how much of a model fits on the card; on a 12 GB card a 7–14B model at 4-bit stays fully on the GPU, and `ollama ps` showing anything other than `100% GPU` means it spilled to CPU.
+- Egress goes through the same proxy sidecar as the agent. Add `^registry\.ollama\.ai$` and `^ollama\.com$` to the allowlist, pull once with `docker compose exec ollama ollama pull <model>`, and watch the proxy log for the blob CDN host the pull redirects to; add that too. After the pull, every line in the proxy log from the `ollama` container is a request it had no business making.
+
+**Wiring it to the agent.** Put the agent on `model-net` as well (`networks: [agent-net, model-net]`) and set `NO_PROXY: ollama` in its environment, so `http://ollama:11434` is reached directly rather than through the proxy. The Tailscale route from the network section still works for a GPU box elsewhere; this is the same-host case.
+
+**Checks.** Add these to the verification table:
+
+| Check | Command | Expected |
+| --- | --- | --- |
+| Toolkit works, no privilege needed | `docker run --rm --device nvidia.com/gpu=0 --user 10002:10002 --cap-drop ALL --read-only debian:trixie-slim nvidia-smi` | The driver table, as on the host |
+| Ollama sees the card | `docker compose logs ollama \| grep -i 'inference compute'` | One line naming the GPU and its VRAM |
+| Model is on the GPU | `docker compose exec ollama ollama ps` | `100% GPU` in the processor column |
+| Still unprivileged | `docker compose exec ollama grep CapEff /proc/self/status` | `0000000000000000` |
+| Only the GPU devices | `docker compose exec ollama ls /dev` | `nvidia0`, `nvidiactl`, `nvidia-uvm` and the standard set; nothing else |
+
+&#91;embedded content: GPU passthrough · what lives in the container vs on the host\]
+
+The container holds the application and the CUDA runtime; the driver libraries and device nodes are lent to it at start, and every GPU call ends in the host kernel.
 
 ## Going further
 

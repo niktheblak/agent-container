@@ -1,5 +1,6 @@
 # allowlist — one extended regex per line, matched against the host
 ^api\.anthropic\.com$
+^platform\.claude\.com$
 ^github\.com$
 ^registry\.npmjs\.org$
 ^proxy\.golang\.org$

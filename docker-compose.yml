@@ -38,7 +38,7 @@ services:
     depends_on: [proxy]
 
   proxy:
-    image: ghcr.io/example/tinyproxy:1.11   # any tinyproxy image; alpine + apk add tinyproxy works
+    image: docker.io/kalaksi/tinyproxy
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -52,6 +52,9 @@ services:
 networks:
   agent-net:
     internal: true
+    ipam:
+      config:
+        - subnet: 10.200.1.0/24   # pinned, so the proxy's Allow line is the same on every host
   egress: {}
 
 volumes:
